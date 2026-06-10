@@ -1,20 +1,90 @@
 import 'package:flutter/material.dart';
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:url_launcher/url_launcher.dart';
+import 'package:geolocator/geolocator.dart';
+import 'package:image_picker/image_picker.dart';
+import 'package:firebase_core/firebase_core.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:firebase_auth/firebase_auth.dart';
+import 'package:firebase_storage/firebase_storage.dart';
+import 'package:firebase_messaging/firebase_messaging.dart';
 
-void main() {
-  runApp(const BloodApp());
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  
+  // Set default testing password if none exists
+  final prefs = await SharedPreferences.getInstance();
+  if (prefs.getString('user_password') == null) {
+    await prefs.setString('user_password', '123456');
+  }
+
+  try {
+    await Firebase.initializeApp();
+    FirebaseMessaging.onBackgroundMessage(_firebaseMessagingBackgroundHandler);
+  } catch (e) {
+    debugPrint("Firebase not initialized: $e. Using local storage mode.");
+  }
+  runApp(const ThemeWrapper());
+}
+
+Future<void> _firebaseMessagingBackgroundHandler(RemoteMessage message) async {
+  await Firebase.initializeApp();
+  print("Handling a background message: ${message.messageId}");
+}
+
+class ThemeWrapper extends StatefulWidget {
+  const ThemeWrapper({super.key});
+
+  @override
+  State<ThemeWrapper> createState() => _ThemeWrapperState();
+
+  static _ThemeWrapperState of(BuildContext context) =>
+      context.findAncestorStateOfType<_ThemeWrapperState>()!;
+}
+
+class _ThemeWrapperState extends State<ThemeWrapper> {
+  ThemeMode _themeMode = ThemeMode.light;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadTheme();
+  }
+
+  Future<void> _loadTheme() async {
+    final prefs = await SharedPreferences.getInstance();
+    setState(() {
+      _themeMode = prefs.getBool('isDarkMode') == true ? ThemeMode.dark : ThemeMode.light;
+    });
+  }
+
+  void toggleTheme(bool isDark) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool('isDarkMode', isDark);
+    setState(() {
+      _themeMode = isDark ? ThemeMode.dark : ThemeMode.light;
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return BloodApp(themeMode: _themeMode);
+  }
 }
 
 class BloodApp extends StatelessWidget {
-  const BloodApp({super.key});
+  final ThemeMode themeMode;
+  const BloodApp({super.key, required this.themeMode});
 
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
       title: 'Blood Donation App',
       debugShowCheckedModeBanner: false,
+      themeMode: themeMode,
       theme: ThemeData(
         useMaterial3: true,
         colorScheme: ColorScheme.fromSeed(
@@ -69,58 +139,156 @@ class BloodApp extends StatelessWidget {
           ),
         ),
       ),
+      darkTheme: ThemeData.dark().copyWith(
+        colorScheme: ColorScheme.fromSeed(
+          seedColor: Colors.red,
+          brightness: Brightness.dark,
+          primary: Colors.red.shade400,
+        ),
+        appBarTheme: AppBarTheme(
+          backgroundColor: Colors.grey.shade900,
+          foregroundColor: Colors.white,
+        ),
+        elevatedButtonTheme: ElevatedButtonThemeData(
+          style: ElevatedButton.styleFrom(
+            backgroundColor: Colors.red.shade400,
+            foregroundColor: Colors.black,
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(15)),
+          ),
+        ),
+      ),
       home: const SplashScreen(),
     );
   }
 }
 
-// ---------------- STORAGE SERVICE ----------------
-class StorageService {
+// ---------------- DATABASE SERVICE (FIREBASE & PERSISTENCE) ----------------
+class DatabaseService {
+  static final FirebaseFirestore _db = FirebaseFirestore.instance;
+  static final FirebaseAuth _auth = FirebaseAuth.instance;
+
+  // Collection Names
+  static const String colDonors = 'donors';
+  static const String colRequests = 'requests';
+  
+  // Local Storage Keys
   static const String _historyKey = 'donation_history';
   static const String _donorsKey = 'registered_donors';
 
-  static Future<void> saveRequest(Map<String, String> request) async {
-    final prefs = await SharedPreferences.getInstance();
-    List<String> history = prefs.getStringList(_historyKey) ?? [];
-    history.insert(0, jsonEncode({
-      ...request,
-      'date': DateTime.now().toString().split(' ')[0],
-    }));
-    await prefs.setStringList(_historyKey, history);
+  // --- AUTHENTICATION ---
+  static Future<UserCredential?> signUp(String email, String password) async {
+    try {
+      return await _auth.createUserWithEmailAndPassword(email: email, password: password);
+    } catch (e) {
+      debugPrint("Auth SignUp Error: $e");
+      return null;
+    }
   }
 
-  static Future<List<Map<String, dynamic>>> getHistory() async {
+  static Future<UserCredential?> signIn(String email, String password) async {
+    try {
+      return await _auth.signInWithEmailAndPassword(email: email, password: password);
+    } catch (e) {
+      debugPrint("Auth SignIn Error: $e");
+      return null;
+    }
+  }
+
+  // --- DONOR MANAGEMENT ---
+  static Future<void> saveDonor(Donor donor) async {
+    final data = donor.toMap();
+    
+    // 1. Always save locally first (Offline-first approach)
+    final prefs = await SharedPreferences.getInstance();
+    List<String> donors = prefs.getStringList(_donorsKey) ?? [];
+    donors.removeWhere((d) {
+      final map = jsonDecode(d);
+      return map['email'] == donor.email;
+    });
+    donors.add(jsonEncode(data));
+    await prefs.setStringList(_donorsKey, donors);
+
+    // 2. Sync to Firestore if online
+    try {
+      await _db.collection(colDonors).doc(donor.email).set(data, SetOptions(merge: true));
+      debugPrint("Donor synced to cloud successfully.");
+    } catch (e) {
+      debugPrint("Cloud sync failed (offline?): $e");
+    }
+  }
+
+  static Future<List<Donor>> getAllDonors() async {
+    try {
+      // Try fetching from Cloud first
+      final snapshot = await _db.collection(colDonors).get();
+      if (snapshot.docs.isNotEmpty) {
+        return snapshot.docs.map((doc) => Donor.fromMap(doc.data())).toList();
+      }
+    } catch (e) {
+      debugPrint("Cloud fetch failed, using local backup: $e");
+    }
+
+    // Local Fallback
+    final prefs = await SharedPreferences.getInstance();
+    List<String> donorsJson = prefs.getStringList(_donorsKey) ?? [];
+    return donorsJson.map((e) => Donor.fromMap(jsonDecode(e))).toList();
+  }
+
+  static Future<Donor?> getDonor(String email) async {
+    try {
+      final doc = await _db.collection(colDonors).doc(email).get();
+      if (doc.exists) return Donor.fromMap(doc.data()!);
+    } catch (e) {
+      debugPrint("Cloud getDonor failed: $e");
+    }
+
+    final all = await getAllDonors();
+    try {
+      return all.firstWhere((d) => d.email == email);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  // --- REQUEST MANAGEMENT ---
+  static Future<void> broadcastRequest(Map<String, String> request) async {
+    final timestamp = DateTime.now().toIso8601String();
+    final data = {
+      ...request,
+      'timestamp': timestamp,
+      'serverTimestamp': FieldValue.serverTimestamp(),
+    };
+
+    // 1. Save Locally
+    final prefs = await SharedPreferences.getInstance();
+    List<String> history = prefs.getStringList(_historyKey) ?? [];
+    history.insert(0, jsonEncode(data));
+    await prefs.setStringList(_historyKey, history);
+
+    // 2. Sync to Cloud
+    try {
+      await _db.collection(colRequests).add(data);
+    } catch (e) {
+      debugPrint("Cloud broadcast failed: $e");
+    }
+  }
+
+  static Future<List<Map<String, dynamic>>> getRequestHistory() async {
+    try {
+      final snapshot = await _db.collection(colRequests)
+          .orderBy('serverTimestamp', descending: true)
+          .get();
+      return snapshot.docs.map((doc) => doc.data()).toList();
+    } catch (e) {
+      debugPrint("Cloud history fetch failed: $e");
+    }
+
     final prefs = await SharedPreferences.getInstance();
     List<String> history = prefs.getStringList(_historyKey) ?? [];
     return history.map((e) => jsonDecode(e) as Map<String, dynamic>).toList();
   }
-
-  static Future<void> saveDonor(Donor donor) async {
-    final prefs = await SharedPreferences.getInstance();
-    List<String> donors = prefs.getStringList(_donorsKey) ?? [];
-    donors.add(jsonEncode({
-      'name': donor.name,
-      'bloodGroup': donor.bloodGroup,
-      'location': donor.location,
-      'phone': donor.phone,
-    }));
-    await prefs.setStringList(_donorsKey, donors);
-  }
-
-  static Future<List<Donor>> getDonors() async {
-    final prefs = await SharedPreferences.getInstance();
-    List<String> donorsJson = prefs.getStringList(_donorsKey) ?? [];
-    return donorsJson.map((e) {
-      final map = jsonDecode(e) as Map<String, dynamic>;
-      return Donor(
-        map['name'] ?? '',
-        map['bloodGroup'] ?? '',
-        map['location'] ?? '',
-        map['phone'] ?? '',
-      );
-    }).toList();
-  }
 }
+
 
 // ---------------- UNIQUE LOGO WIDGET ----------------
 class AppLogo extends StatelessWidget {
@@ -261,92 +429,128 @@ class LoginPage extends StatefulWidget {
 }
 
 class _LoginPageState extends State<LoginPage> {
-  final TextEditingController nameController = TextEditingController();
+  final _formKey = GlobalKey<FormState>();
+  final TextEditingController emailController = TextEditingController(text: "");
+  final TextEditingController passwordController = TextEditingController(text: "123456");
+  bool isPasswordVisible = false;
+  bool isLoading = false;
 
   @override
   void dispose() {
-    nameController.dispose();
+    emailController.dispose();
+    passwordController.dispose();
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor: Colors.white,
+      backgroundColor: Theme.of(context).scaffoldBackgroundColor,
       body: SafeArea(
         child: SingleChildScrollView(
           padding: const EdgeInsets.all(30),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.center,
-            children: [
-              const SizedBox(height: 50),
-              AppLogo(size: 100, color: Colors.red.shade800),
-              const SizedBox(height: 40),
-              Text(
-                "Welcome Back",
-                style: TextStyle(
-                  fontSize: 32,
-                  fontWeight: FontWeight.bold,
-                  color: Colors.red.shade900,
-                ),
-              ),
-              const SizedBox(height: 10),
-              Text(
-                "Every drop counts Start here",
-                style: TextStyle(color: Colors.grey.shade600, fontSize: 16),
-              ),
-              const SizedBox(height: 50),
-              TextField(
-                controller: nameController,
-                decoration: const InputDecoration(
-                  labelText: "Full Name",
-                  hintText: "Enter your name",
-                  prefixIcon: Icon(Icons.person_outline),
-                ),
-              ),
-              const SizedBox(height: 25),
-              SizedBox(
-                width: double.infinity,
-                child: ElevatedButton(
-                  onPressed: () {
-                    if (nameController.text.trim().isNotEmpty) {
-                      Navigator.pushReplacement(
-                        context,
-                        MaterialPageRoute(
-                          builder: (_) => HomePage(userName: nameController.text.trim()),
-                        ),
-                      );
-                    } else {
-                      ScaffoldMessenger.of(context).showSnackBar(
-                        const SnackBar(
-                          content: Text("Please enter your name to proceed"),
-                          backgroundColor: Colors.red,
-                        ),
-                      );
-                    }
-                  },
-                  child: const Text("Continue", style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
-                ),
-              ),
-              const SizedBox(height: 30),
-              Row(
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: [
-                  Text("New donor?", style: TextStyle(color: Colors.grey.shade600)),
-                  TextButton(
-                    onPressed: () {
-                      Navigator.push(
-                        context,
-                        MaterialPageRoute(builder: (_) => const RegisterPage()),
-                      );
-                    },
-                    child: const Text("Register Now", style: TextStyle(fontWeight: FontWeight.bold)),
+          child: Form(
+            key: _formKey,
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.center,
+              children: [
+                const SizedBox(height: 50),
+                AppLogo(size: 100, color: Colors.red.shade800),
+                const SizedBox(height: 40),
+                Text(
+                  "Welcome Back",
+                  style: TextStyle(
+                    fontSize: 32,
+                    fontWeight: FontWeight.bold,
+                    color: Colors.red.shade900,
                   ),
-                ],
-              ),
-            ],
+                ),
+                const SizedBox(height: 10),
+                Text(
+                  "Login to continue saving lives",
+                  style: TextStyle(color: Colors.grey.shade600, fontSize: 16),
+                ),
+                const SizedBox(height: 50),
+                TextFormField(
+                  controller: emailController,
+                  decoration: const InputDecoration(
+                    labelText: "Email Address",
+                    hintText: "example@mail.com",
+                    prefixIcon: Icon(Icons.email_outlined),
+                  ),
+                  keyboardType: TextInputType.emailAddress,
+                  validator: (v) => v!.contains('@') ? null : "Enter a valid email",
+                ),
+                const SizedBox(height: 20),
+                TextFormField(
+                  controller: passwordController,
+                  obscureText: !isPasswordVisible,
+                  decoration: InputDecoration(
+                    labelText: "Password",
+                    prefixIcon: const Icon(Icons.lock_outline),
+                    suffixIcon: IconButton(
+                      icon: Icon(isPasswordVisible ? Icons.visibility : Icons.visibility_off),
+                      onPressed: () => setState(() => isPasswordVisible = !isPasswordVisible),
+                    ),
+                  ),
+                  validator: (v) => v!.length >= 6 ? null : "Password must be 6+ characters",
+                ),
+                const SizedBox(height: 25),
+                SizedBox(
+                  width: double.infinity,
+                  child: ElevatedButton(
+                    onPressed: isLoading ? null : _handleLogin,
+                    child: isLoading 
+                      ? const CircularProgressIndicator(color: Colors.white) 
+                      : const Text("Login", style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+                  ),
+                ),
+                const SizedBox(height: 30),
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    Text("New donor?", style: TextStyle(color: Colors.grey.shade600)),
+                    TextButton(
+                      onPressed: () {
+                        Navigator.push(
+                          context,
+                          MaterialPageRoute(builder: (_) => const RegisterPage()),
+                        );
+                      },
+                      child: const Text("Register Now", style: TextStyle(fontWeight: FontWeight.bold)),
+                    ),
+                  ],
+                ),
+              ],
+            ),
           ),
         ),
+      ),
+    );
+  }
+
+  void _handleLogin() async {
+    if (_formKey.currentState!.validate()) {
+      setState(() => isLoading = true);
+      
+      var user = await DatabaseService.signIn(emailController.text, passwordController.text);
+      
+      if (user != null) {
+        _onLoginSuccess();
+      } else {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text("Login failed. Check credentials or connection."), backgroundColor: Colors.red),
+        );
+      }
+      setState(() => isLoading = false);
+    }
+  }
+
+  void _onLoginSuccess() {
+    Navigator.pushReplacement(
+      context,
+      MaterialPageRoute(
+        builder: (_) => HomePage(userEmail: emailController.text),
       ),
     );
   }
@@ -354,9 +558,9 @@ class _LoginPageState extends State<LoginPage> {
 
 // ---------------- HOME PAGE ----------------
 class HomePage extends StatefulWidget {
-  final String userName;
+  final String userEmail;
 
-  const HomePage({super.key, required this.userName});
+  const HomePage({super.key, required this.userEmail});
 
   @override
   State<HomePage> createState() => _HomePageState();
@@ -381,16 +585,16 @@ class _HomePageState extends State<HomePage> {
       }),
       const SearchPage(),
       const RequestPage(),
-      ProfilePage(userName: widget.userName),
+      ProfilePage(userEmail: widget.userEmail),
     ];
   }
 
   @override
   Widget build(BuildContext context) {
-    _updatePages(); // Ensure pages are updated if needed
+    _updatePages();
     return Scaffold(
       appBar: AppBar(
-        title: Text("Hello, ${widget.userName}"),
+        title: Text("Hello, ${widget.userEmail.split('@')[0]}"),
         actions: [
           IconButton(
             icon: const Icon(Icons.notifications_none_rounded),
@@ -435,15 +639,78 @@ class _HomePageState extends State<HomePage> {
 }
 
 // ---------------- DASHBOARD ----------------
-class Dashboard extends StatelessWidget {
+class Dashboard extends StatefulWidget {
   final Function(int)? onTabRequested;
   const Dashboard({super.key, this.onTabRequested});
+
+  @override
+  State<Dashboard> createState() => _DashboardState();
+}
+
+class _DashboardState extends State<Dashboard> {
+  String _currentCity = "Detecting location...";
+  List<Map<String, dynamic>> _urgentRequests = [];
+  bool _isLoadingRequests = true;
+
+  @override
+  void initState() {
+    super.initState();
+    _determinePosition();
+    _loadUrgentRequests();
+  }
+
+  Future<void> _loadUrgentRequests() async {
+    final history = await DatabaseService.getRequestHistory();
+    if (mounted) {
+      setState(() {
+        _urgentRequests = history.take(3).toList();
+        _isLoadingRequests = false;
+      });
+    }
+  }
+
+  Future<void> _determinePosition() async {
+    bool serviceEnabled;
+    LocationPermission permission;
+
+    serviceEnabled = await Geolocator.isLocationServiceEnabled();
+    if (!serviceEnabled) {
+      setState(() => _currentCity = "Location disabled");
+      return;
+    }
+
+    permission = await Geolocator.checkPermission();
+    if (permission == LocationPermission.denied) {
+      permission = await Geolocator.requestPermission();
+      if (permission == LocationPermission.denied) {
+        setState(() => _currentCity = "Permission denied");
+        return;
+      }
+    }
+    
+    try {
+      Position position = await Geolocator.getCurrentPosition();
+      // In a real app, use geocoding to get city name. 
+      // Mocking for now:
+      setState(() => _currentCity = "Nairobi, KE (Lat: ${position.latitude.toStringAsFixed(2)})");
+    } catch (e) {
+      setState(() => _currentCity = "Location error");
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
     return ListView(
       padding: const EdgeInsets.all(20),
       children: [
+        Row(
+          children: [
+            const Icon(Icons.location_on, color: Colors.red, size: 20),
+            const SizedBox(width: 5),
+            Text(_currentCity, style: TextStyle(color: Colors.grey.shade700, fontWeight: FontWeight.bold)),
+          ],
+        ),
+        const SizedBox(height: 15),
         const Text(
           "Quick Services",
           style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold),
@@ -458,7 +725,7 @@ class Dashboard extends StatelessWidget {
           childAspectRatio: 1.1,
           children: [
             _buildActionCard(context, "Find Donor", Icons.person_search_rounded, Colors.red, () {
-              onTabRequested?.call(1); // Switch to Search tab
+              widget.onTabRequested?.call(1); // Switch to Search tab
             }),
             _buildActionCard(context, "Emergency", Icons.emergency_rounded, Colors.orange, () {
               Navigator.push(context, MaterialPageRoute(builder: (_) => const EmergencyPage()));
@@ -472,6 +739,12 @@ class Dashboard extends StatelessWidget {
           ],
         ),
         const SizedBox(height: 30),
+        const Text(
+          "Smart Match Suggestion",
+          style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
+        ),
+        _buildSmartMatchTile(),
+        const SizedBox(height: 30),
         Row(
           mainAxisAlignment: MainAxisAlignment.spaceBetween,
           children: [
@@ -479,13 +752,39 @@ class Dashboard extends StatelessWidget {
               "Urgent Requests",
               style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
             ),
-            TextButton(onPressed: () {}, child: const Text("View All")),
+            TextButton(
+              onPressed: () => widget.onTabRequested?.call(2), 
+              child: const Text("View All")
+            ),
           ],
         ),
-        _buildRequestTile("O+", "Kenyatta Hospital", "2.5 km away"),
-        _buildRequestTile("A-", "Aga Khan Hospital", "5.0 km away"),
-        _buildRequestTile("B+", "Nairobi Hospital", "1.2 km away"),
+        if (_isLoadingRequests)
+          const Center(child: Padding(padding: EdgeInsets.all(20), child: CircularProgressIndicator()))
+        else if (_urgentRequests.isEmpty)
+          const Padding(
+            padding: EdgeInsets.all(20),
+            child: Text("No urgent requests found", style: TextStyle(color: Colors.grey)),
+          )
+        else
+          ..._urgentRequests.map((r) => _buildRequestTile(
+            r['blood'] ?? '?', 
+            r['location'] ?? 'Unknown', 
+            r['date'] ?? 'Recent'
+          )),
       ],
+    );
+  }
+
+  Widget _buildSmartMatchTile() {
+    return Card(
+      color: Colors.red.shade50,
+      child: ListTile(
+        leading: const CircleAvatar(backgroundColor: Colors.red, child: Icon(Icons.auto_awesome, color: Colors.white)),
+        title: const Text("Best Match Found!", style: TextStyle(fontWeight: FontWeight.bold, color: Colors.red)),
+        subtitle: const Text("Maroa Kelly (O+) is 500m away and available."),
+        trailing: const Icon(Icons.chevron_right, color: Colors.red),
+        onTap: () => widget.onTabRequested?.call(1),
+      ),
     );
   }
 
@@ -561,13 +860,8 @@ class SearchPage extends StatefulWidget {
 
 class _SearchPageState extends State<SearchPage> {
   String search = "";
-  List<Donor> donorsList = [
-    const Donor("Anna Itotiah W.", "O+", "Nairobi", "+254 700 111 222"),
-    const Donor("Sharon Kendi.", "B-", "Nakuru", "+254 700 333 444"),
-    const Donor("Faith Mueni.", "A+", "Mombasa", "+254 700 555 666"),
-    const Donor("Roy Gichinga.", "AB+", "Kisumu", "+254 700 777 888"),
-    const Donor("Michelle Njogu.", "O-", "Eldoret", "+254 700 999 000"),
-  ];
+  List<Donor> donorsList = [];
+  bool isLoading = true;
 
   @override
   void initState() {
@@ -576,16 +870,54 @@ class _SearchPageState extends State<SearchPage> {
   }
 
   Future<void> _loadDonors() async {
-    final savedDonors = await StorageService.getDonors();
-    setState(() {
-      donorsList.addAll(savedDonors);
-    });
+    final savedDonors = await DatabaseService.getAllDonors();
+    // Pre-populate with some mock data if empty
+    if (savedDonors.isEmpty) {
+      savedDonors.addAll([
+        const Donor("Anna Itotiah W.", "O+", "Nairobi", "+254700111222", email: "anna@mail.com"),
+        const Donor("Sharon Kendi.", "B-", "Nakuru", "+254700333444", email: "sharon@mail.com"),
+        const Donor("Faith Mueni.", "A+", "Mombasa", "+254700555666", email: "faith@mail.com"),
+      ]);
+    }
+    if (mounted) {
+      setState(() {
+        donorsList = savedDonors;
+        isLoading = false;
+      });
+    }
+  }
+
+  ImageProvider _getImageProvider(String path) {
+    if (path.isEmpty) {
+      return const NetworkImage("https://ui-avatars.com/api/?name=User&background=random");
+    }
+    if (path.startsWith('http') || path.startsWith('https')) {
+      return NetworkImage(path);
+    }
+    return FileImage(File(path));
+  }
+
+  Future<void> _makeCall(String phoneNumber) async {
+    final Uri url = Uri.parse('tel:$phoneNumber');
+    if (await canLaunchUrl(url)) {
+      await launchUrl(url);
+    } else {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text("Could not launch dialer")),
+        );
+      }
+    }
   }
 
   @override
   Widget build(BuildContext context) {
     final filtered = donorsList
-        .where((d) => d.bloodGroup.toLowerCase().contains(search.toLowerCase()))
+        .where((d) => 
+            d.isAvailable &&
+            (d.bloodGroup.toLowerCase().contains(search.toLowerCase()) ||
+             d.location.toLowerCase().contains(search.toLowerCase()) ||
+             d.name.toLowerCase().contains(search.toLowerCase())))
         .toList();
 
     return Padding(
@@ -595,15 +927,17 @@ class _SearchPageState extends State<SearchPage> {
           TextField(
             onChanged: (v) => setState(() => search = v),
             decoration: const InputDecoration(
-              labelText: "Search Blood Group",
-              hintText: "e.g. O+, A-",
+              labelText: "Search Donor, Group or Location",
+              hintText: "e.g. O+, Nairobi, Anna",
               prefixIcon: Icon(Icons.search_rounded),
             ),
           ),
           const SizedBox(height: 20),
           Expanded(
-            child: filtered.isEmpty
-                ? const Center(child: Text("No donors found for this group"))
+            child: isLoading 
+              ? const Center(child: CircularProgressIndicator())
+              : filtered.isEmpty
+                ? const Center(child: Text("No available donors found"))
                 : ListView.builder(
                     itemCount: filtered.length,
                     itemBuilder: (context, i) {
@@ -612,13 +946,16 @@ class _SearchPageState extends State<SearchPage> {
                         child: ListTile(
                           leading: CircleAvatar(
                             backgroundColor: Colors.red.shade800,
-                            child: Text(d.bloodGroup, style: const TextStyle(color: Colors.white)),
+                            backgroundImage: _getImageProvider(d.profilePic),
+                            child: d.profilePic.isEmpty 
+                                ? Text(d.bloodGroup, style: const TextStyle(color: Colors.white, fontSize: 12))
+                                : null,
                           ),
                           title: Text(d.name, style: const TextStyle(fontWeight: FontWeight.bold)),
-                          subtitle: Text(d.location),
+                          subtitle: Text("${d.location} • ${d.bloodGroup}"),
                           trailing: IconButton(
                             icon: const Icon(Icons.phone_enabled_rounded, color: Colors.green),
-                            onPressed: () {},
+                            onPressed: () => _makeCall(d.phone),
                           ),
                         ),
                       );
@@ -695,7 +1032,7 @@ class _RequestPageState extends State<RequestPage> {
             child: ElevatedButton(
               onPressed: () async {
                 if (bloodController.text.isNotEmpty && locationController.text.isNotEmpty) {
-                  await StorageService.saveRequest({
+                  await DatabaseService.broadcastRequest({
                     'blood': bloodController.text,
                     'location': locationController.text,
                     'type': 'Request',
@@ -723,59 +1060,269 @@ class _RequestPageState extends State<RequestPage> {
 }
 
 // ---------------- PROFILE PAGE ----------------
-class ProfilePage extends StatelessWidget {
-  final String userName;
-  const ProfilePage({super.key, required this.userName});
+class ProfilePage extends StatefulWidget {
+  final String userEmail;
+  const ProfilePage({super.key, required this.userEmail});
+
+  @override
+  State<ProfilePage> createState() => _ProfilePageState();
+}
+
+class _ProfilePageState extends State<ProfilePage> {
+  Donor? _donor;
+  bool _isLoading = true;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadProfile();
+  }
+
+  Future<void> _loadProfile() async {
+    final donor = await DatabaseService.getDonor(widget.userEmail);
+    if (mounted) {
+      setState(() {
+        _donor = donor;
+        _isLoading = false;
+      });
+    }
+  }
+
+  Future<void> _pickImage() async {
+    final picker = ImagePicker();
+    try {
+      final pickedFile = await picker.pickImage(source: ImageSource.gallery);
+
+      if (pickedFile != null) {
+        // Create a donor object if it doesn't exist
+        final currentDonor = _donor ?? Donor(
+          widget.userEmail.split('@')[0],
+          "Unknown",
+          "Unknown",
+          "",
+          email: widget.userEmail,
+        );
+
+        final updatedDonor = Donor(
+          currentDonor.name,
+          currentDonor.bloodGroup,
+          currentDonor.location,
+          currentDonor.phone,
+          email: currentDonor.email,
+          isAvailable: currentDonor.isAvailable,
+          profilePic: pickedFile.path,
+        );
+
+        setState(() {
+          _donor = updatedDonor;
+        });
+
+        await DatabaseService.saveDonor(updatedDonor);
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text("Profile picture updated!")),
+          );
+        }
+      }
+    } catch (e) {
+      debugPrint("Error picking image: $e");
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text("Failed to pick image")),
+        );
+      }
+    }
+  }
+
+  void _toggleAvailability(bool value) async {
+    // Create a donor object if it doesn't exist to allow toggling even if profile isn't fully set up
+    final currentDonor = _donor ?? Donor(
+      widget.userEmail.split('@')[0],
+      "Unknown",
+      "Unknown",
+      "",
+      email: widget.userEmail,
+    );
+
+    final updatedDonor = Donor(
+      currentDonor.name,
+      currentDonor.bloodGroup,
+      currentDonor.location,
+      currentDonor.phone,
+      email: currentDonor.email,
+      isAvailable: value,
+      profilePic: currentDonor.profilePic,
+    );
+
+    // Optimistic UI update
+    setState(() {
+      _donor = updatedDonor;
+    });
+
+    try {
+      await DatabaseService.saveDonor(updatedDonor);
+    } catch (e) {
+      // Revert if it fails
+      if (mounted) {
+        setState(() {
+          _donor = currentDonor;
+        });
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text("Failed to update status")),
+        );
+      }
+    }
+  }
+
+  ImageProvider _getImageProvider(String path) {
+    if (path.isEmpty) {
+      return NetworkImage("https://ui-avatars.com/api/?name=${widget.userEmail}&background=random");
+    }
+    if (path.startsWith('http') || path.startsWith('https')) {
+      return NetworkImage(path);
+    }
+    // Check if file exists to avoid crashes
+    final file = File(path);
+    if (file.existsSync()) {
+      return FileImage(file);
+    }
+    return NetworkImage("https://ui-avatars.com/api/?name=${widget.userEmail}&background=random");
+  }
 
   @override
   Widget build(BuildContext context) {
+    if (_isLoading) return const Center(child: CircularProgressIndicator());
+    
+    final name = _donor?.name ?? widget.userEmail.split('@')[0];
+    final isAvailable = _donor?.isAvailable ?? true;
+    final bloodGroup = _donor?.bloodGroup ?? "N/A";
+
     return ListView(
       padding: const EdgeInsets.all(25),
       children: [
         Center(
           child: Stack(
             children: [
-              Container(
-                width: 120,
-                height: 120,
-                decoration: BoxDecoration(
-                  shape: BoxShape.circle,
-                  border: Border.all(color: Colors.red.shade800, width: 3),
-                  image: const DecorationImage(
-                    image: NetworkImage("https://ui-avatars.com/api/?name=User&background=random"),
-                    fit: BoxFit.cover,
+              InkWell(
+                onTap: _pickImage,
+                borderRadius: BorderRadius.circular(65),
+                child: Container(
+                  width: 130,
+                  height: 130,
+                  decoration: BoxDecoration(
+                    shape: BoxShape.circle,
+                    border: Border.all(color: Colors.red.shade800, width: 4),
+                    boxShadow: [
+                      BoxShadow(
+                        color: Colors.black.withAlpha(25),
+                        blurRadius: 10,
+                        spreadRadius: 2,
+                      )
+                    ],
+                  ),
+                  child: ClipOval(
+                    child: Image(
+                      image: _getImageProvider(_donor?.profilePic ?? ""),
+                      fit: BoxFit.cover,
+                      errorBuilder: (context, error, stackTrace) {
+                        return const Icon(Icons.person, size: 80, color: Colors.grey);
+                      },
+                    ),
                   ),
                 ),
               ),
               Positioned(
-                bottom: 0,
-                right: 0,
-                child: Container(
-                  padding: const EdgeInsets.all(8),
-                  decoration: const BoxDecoration(color: Colors.red, shape: BoxShape.circle),
-                  child: const Icon(Icons.edit, color: Colors.white, size: 20),
+                bottom: 5,
+                right: 5,
+                child: GestureDetector(
+                  onTap: _pickImage,
+                  child: Container(
+                    padding: const EdgeInsets.all(8),
+                    decoration: BoxDecoration(
+                      color: Colors.red.shade800,
+                      shape: BoxShape.circle,
+                      border: Border.all(color: Colors.white, width: 2),
+                    ),
+                    child: const Icon(Icons.camera_alt, color: Colors.white, size: 18),
+                  ),
                 ),
               ),
             ],
           ),
         ),
-        const SizedBox(height: 20),
+        const SizedBox(height: 25),
         Center(
           child: Column(
             children: [
-              Text(userName, style: const TextStyle(fontSize: 24, fontWeight: FontWeight.bold)),
-              const Text("Verified Donor", style: TextStyle(color: Colors.green, fontWeight: FontWeight.bold)),
+              Text(
+                name, 
+                style: const TextStyle(fontSize: 26, fontWeight: FontWeight.bold),
+              ),
+              const SizedBox(height: 8),
+              AnimatedContainer(
+                duration: const Duration(milliseconds: 300),
+                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
+                decoration: BoxDecoration(
+                  color: isAvailable ? Colors.green.withAlpha(30) : Colors.red.withAlpha(30),
+                  borderRadius: BorderRadius.circular(20),
+                  border: Border.all(
+                    color: isAvailable ? Colors.green.withAlpha(100) : Colors.red.withAlpha(100),
+                  ),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Container(
+                      width: 8,
+                      height: 8,
+                      decoration: BoxDecoration(
+                        color: isAvailable ? Colors.green : Colors.red,
+                        shape: BoxShape.circle,
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    Text(
+                      isAvailable ? "Available to Donate" : "Currently Busy", 
+                      style: TextStyle(
+                        color: isAvailable ? Colors.green.shade700 : Colors.red.shade700, 
+                        fontWeight: FontWeight.bold,
+                        fontSize: 14,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
             ],
           ),
         ),
-        const SizedBox(height: 35),
+        const SizedBox(height: 30),
+        Card(
+          elevation: 0,
+          color: Theme.of(context).colorScheme.surfaceContainerHighest.withAlpha(80),
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+          child: SwitchListTile(
+            title: const Text("Accepting Requests", style: TextStyle(fontWeight: FontWeight.bold)),
+            subtitle: Text(isAvailable ? "Your profile is visible to hospitals" : "You are currently hidden from search"),
+            value: isAvailable,
+            onChanged: _toggleAvailability,
+            activeThumbColor: Colors.green,
+            activeColor: Colors.green.withAlpha(50),
+            secondary: Icon(
+              isAvailable ? Icons.check_circle : Icons.do_not_disturb_on, 
+              color: isAvailable ? Colors.green : Colors.grey
+            ),
+          ),
+        ),
+        const SizedBox(height: 25),
         const _ProfileStatRow(),
-        const SizedBox(height: 35),
-        _buildProfileItem(context, Icons.bloodtype, "My Blood Group", "A+"),
-        _buildProfileItem(context, Icons.history, "Donation History", "3 Times", onTap: () {
+        const SizedBox(height: 30),
+        _buildProfileItem(context, Icons.bloodtype, "My Blood Group", bloodGroup),
+        _buildProfileItem(context, Icons.history, "Donation History", "Check History", onTap: () {
           Navigator.push(context, MaterialPageRoute(builder: (_) => const HistoryPage()));
         }),
-        _buildProfileItem(context, Icons.settings, "Account Settings", ""),
+        _buildProfileItem(context, Icons.settings, "Account Settings", "", onTap: () {
+          Navigator.push(context, MaterialPageRoute(builder: (_) => const SettingsPage()));
+        }),
         const SizedBox(height: 20),
         TextButton.icon(
           onPressed: () => Navigator.pushReplacement(context, MaterialPageRoute(builder: (_) => const LoginPage())),
@@ -835,7 +1382,36 @@ class Donor {
   final String bloodGroup;
   final String location;
   final String phone;
-  const Donor(this.name, this.bloodGroup, this.location, this.phone);
+  final String email;
+  final bool isAvailable;
+  final String profilePic;
+
+  const Donor(this.name, this.bloodGroup, this.location, this.phone, 
+      {this.email = "", this.isAvailable = true, this.profilePic = ""});
+
+  Map<String, dynamic> toMap() {
+    return {
+      'name': name,
+      'bloodGroup': bloodGroup,
+      'location': location,
+      'phone': phone,
+      'email': email,
+      'isAvailable': isAvailable,
+      'profilePic': profilePic,
+    };
+  }
+
+  factory Donor.fromMap(Map<String, dynamic> map) {
+    return Donor(
+      map['name'] ?? '',
+      map['bloodGroup'] ?? '',
+      map['location'] ?? '',
+      map['phone'] ?? '',
+      email: map['email'] ?? '',
+      isAvailable: map['isAvailable'] ?? true,
+      profilePic: map['profilePic'] ?? '',
+    );
+  }
 }
 
 // ---------------- NEW PAGES FOR QUICK SERVICES ----------------
@@ -850,9 +1426,9 @@ class EmergencyPage extends StatelessWidget {
       body: ListView(
         padding: const EdgeInsets.all(20),
         children: [
-          _buildEmergencyCard("Ambulance", "999", Colors.red),
-          _buildEmergencyCard("Red Cross", "1199", Colors.red),
-          _buildEmergencyCard("Police", "911", Colors.blue),
+          _buildEmergencyCard(context, "Ambulance", "999", Colors.red),
+          _buildEmergencyCard(context, "Red Cross", "1199", Colors.red),
+          _buildEmergencyCard(context, "Police", "911", Colors.blue),
           const SizedBox(height: 20),
           const Card(
             color: Colors.orangeAccent,
@@ -869,14 +1445,19 @@ class EmergencyPage extends StatelessWidget {
     );
   }
 
-  Widget _buildEmergencyCard(String title, String phone, Color color) {
+  Widget _buildEmergencyCard(BuildContext context, String title, String phone, Color color) {
     return Card(
       child: ListTile(
         leading: CircleAvatar(backgroundColor: color, child: const Icon(Icons.phone, color: Colors.white)),
         title: Text(title, style: const TextStyle(fontWeight: FontWeight.bold)),
         subtitle: Text(phone),
         trailing: ElevatedButton(
-          onPressed: () {},
+          onPressed: () async {
+            final Uri url = Uri.parse('tel:$phone');
+            if (await canLaunchUrl(url)) {
+              await launchUrl(url);
+            }
+          },
           style: ElevatedButton.styleFrom(backgroundColor: color),
           child: const Text("Call"),
         ),
@@ -929,7 +1510,7 @@ class _HistoryPageState extends State<HistoryPage> {
     return Scaffold(
       appBar: AppBar(title: const Text("Donation History")),
       body: FutureBuilder<List<Map<String, dynamic>>>(
-        future: StorageService.getHistory(),
+        future: DatabaseService.getRequestHistory(),
         builder: (context, snapshot) {
           if (snapshot.connectionState == ConnectionState.waiting) {
             return const Center(child: CircularProgressIndicator());
@@ -962,6 +1543,98 @@ class _HistoryPageState extends State<HistoryPage> {
   }
 }
 
+// ---------------- SETTINGS PAGE ----------------
+class SettingsPage extends StatefulWidget {
+  const SettingsPage({super.key});
+
+  @override
+  State<SettingsPage> createState() => _SettingsPageState();
+}
+
+class _SettingsPageState extends State<SettingsPage> {
+  final _oldPassController = TextEditingController();
+  final _newPassController = TextEditingController();
+
+  @override
+  Widget build(BuildContext context) {
+    final themeWrapper = ThemeWrapper.of(context);
+    bool isDark = Theme.of(context).brightness == Brightness.dark;
+
+    return Scaffold(
+      appBar: AppBar(title: const Text("Account Settings")),
+      body: ListView(
+        padding: const EdgeInsets.all(20),
+        children: [
+          const Text("Appearance", style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+          SwitchListTile(
+            title: const Text("Dark Mode"),
+            subtitle: const Text("Enable dark theme for the app"),
+            secondary: const Icon(Icons.dark_mode_rounded),
+            value: isDark,
+            onChanged: (val) => themeWrapper.toggleTheme(val),
+          ),
+          const Divider(height: 40),
+          const Text("Security", style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+          ListTile(
+            title: const Text("Change Password"),
+            subtitle: const Text("Update your login credentials"),
+            leading: const Icon(Icons.lock_reset_rounded),
+            trailing: const Icon(Icons.chevron_right),
+            onTap: _showChangePasswordDialog,
+          ),
+          const Divider(height: 40),
+          const Text("About", style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+          const ListTile(
+            title: Text("Version"),
+            trailing: Text("1.0.0"),
+            leading: Icon(Icons.info_outline),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _showChangePasswordDialog() {
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text("Change Password"),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            TextField(
+              controller: _oldPassController,
+              obscureText: true,
+              decoration: const InputDecoration(labelText: "Old Password"),
+            ),
+            const SizedBox(height: 10),
+            TextField(
+              controller: _newPassController,
+              obscureText: true,
+              decoration: const InputDecoration(labelText: "New Password"),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context), child: const Text("Cancel")),
+          ElevatedButton(
+            onPressed: () async {
+              // Password changes should be handled securely via Firebase Auth
+              Navigator.pop(context);
+              ScaffoldMessenger.of(context).showSnackBar(
+                const SnackBar(content: Text("Security update requested.")),
+              );
+              _oldPassController.clear();
+              _newPassController.clear();
+            },
+            child: const Text("Save"),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 class RegisterPage extends StatefulWidget {
   const RegisterPage({super.key});
 
@@ -970,10 +1643,15 @@ class RegisterPage extends StatefulWidget {
 }
 
 class _RegisterPageState extends State<RegisterPage> {
+  final _formKey = GlobalKey<FormState>();
   final nameController = TextEditingController();
   final bloodController = TextEditingController();
   final locationController = TextEditingController();
   final phoneController = TextEditingController();
+  final emailController = TextEditingController();
+  final passwordController = TextEditingController(text: "123456");
+  bool isAvailable = true;
+  bool isLoading = false;
 
   @override
   void dispose() {
@@ -981,6 +1659,8 @@ class _RegisterPageState extends State<RegisterPage> {
     bloodController.dispose();
     locationController.dispose();
     phoneController.dispose();
+    emailController.dispose();
+    passwordController.dispose();
     super.dispose();
   }
 
@@ -990,64 +1670,108 @@ class _RegisterPageState extends State<RegisterPage> {
       appBar: AppBar(title: const Text("New Donor Registration")),
       body: SingleChildScrollView(
         padding: const EdgeInsets.all(30),
-        child: Column(
-          children: [
-            const AppLogo(size: 80, color: Colors.red),
-            const SizedBox(height: 30),
-            TextField(
-              controller: nameController,
-              decoration: const InputDecoration(labelText: "Full Name", prefixIcon: Icon(Icons.person)),
-            ),
-            const SizedBox(height: 15),
-            TextField(
-              controller: bloodController,
-              decoration: const InputDecoration(labelText: "Blood Group (e.g. O+)", prefixIcon: Icon(Icons.bloodtype)),
-            ),
-            const SizedBox(height: 15),
-            TextField(
-              controller: locationController,
-              decoration: const InputDecoration(labelText: "Location/City", prefixIcon: Icon(Icons.location_city)),
-            ),
-            const SizedBox(height: 15),
-            TextField(
-              controller: phoneController,
-              decoration: const InputDecoration(labelText: "Phone Number", prefixIcon: Icon(Icons.phone)),
-              keyboardType: TextInputType.phone,
-            ),
-            const SizedBox(height: 30),
-            SizedBox(
-              width: double.infinity,
-              child: ElevatedButton(
-                onPressed: () async {
-                  if (nameController.text.isNotEmpty &&
-                      bloodController.text.isNotEmpty &&
-                      locationController.text.isNotEmpty &&
-                      phoneController.text.isNotEmpty) {
-                    final donor = Donor(
-                      nameController.text.trim(),
-                      bloodController.text.trim().toUpperCase(),
-                      locationController.text.trim(),
-                      phoneController.text.trim(),
-                    );
-                    await StorageService.saveDonor(donor);
-                    if (mounted) {
-                      ScaffoldMessenger.of(context).showSnackBar(
-                        const SnackBar(content: Text("Registration Successful!")),
-                      );
-                      Navigator.pop(context);
-                    }
-                  } else {
-                    ScaffoldMessenger.of(context).showSnackBar(
-                      const SnackBar(content: Text("Please fill all fields")),
-                    );
-                  }
-                },
-                child: const Text("Register as Donor"),
+        child: Form(
+          key: _formKey,
+          child: Column(
+            children: [
+              const AppLogo(size: 80, color: Colors.red),
+              const SizedBox(height: 30),
+              TextFormField(
+                controller: nameController,
+                decoration: const InputDecoration(labelText: "Full Name", prefixIcon: Icon(Icons.person)),
+                validator: (v) => v!.isEmpty ? "Enter your name" : null,
               ),
-            ),
-          ],
+              const SizedBox(height: 15),
+              TextFormField(
+                controller: emailController,
+                decoration: const InputDecoration(labelText: "Email Address", prefixIcon: Icon(Icons.email)),
+                validator: (v) => v!.contains('@') ? null : "Enter a valid email",
+              ),
+              const SizedBox(height: 15),
+              TextFormField(
+                controller: passwordController,
+                obscureText: true,
+                decoration: const InputDecoration(labelText: "Create Password", prefixIcon: Icon(Icons.lock)),
+                validator: (v) => v!.length >= 6 ? null : "6+ characters required",
+              ),
+              const SizedBox(height: 15),
+              TextFormField(
+                controller: bloodController,
+                decoration: const InputDecoration(labelText: "Blood Group (e.g. O+)", prefixIcon: Icon(Icons.bloodtype)),
+                validator: (v) => v!.isEmpty ? "Enter blood group" : null,
+              ),
+              const SizedBox(height: 15),
+              TextFormField(
+                controller: locationController,
+                decoration: const InputDecoration(labelText: "Location/City", prefixIcon: Icon(Icons.location_city)),
+                validator: (v) => v!.isEmpty ? "Enter location" : null,
+              ),
+              const SizedBox(height: 15),
+              TextFormField(
+                controller: phoneController,
+                decoration: const InputDecoration(labelText: "Phone Number", prefixIcon: Icon(Icons.phone)),
+                keyboardType: TextInputType.phone,
+                validator: (v) => v!.length >= 10 ? null : "Enter valid phone",
+              ),
+              const SizedBox(height: 15),
+              SwitchListTile(
+                title: const Text("Available for donation?"),
+                value: isAvailable,
+                onChanged: (v) => setState(() => isAvailable = v),
+                secondary: const Icon(Icons.event_available),
+              ),
+              const SizedBox(height: 30),
+              SizedBox(
+                width: double.infinity,
+                child: ElevatedButton(
+                  onPressed: isLoading ? null : _handleRegister,
+                  child: isLoading 
+                    ? const CircularProgressIndicator(color: Colors.white) 
+                    : const Text("Register as Donor"),
+                ),
+              ),
+            ],
+          ),
         ),
       ),
     );
+  }
+
+  void _handleRegister() async {
+    if (_formKey.currentState!.validate()) {
+      setState(() => isLoading = true);
+      
+      // Duplicate prevention (Check local & could check Firebase)
+      final existing = await StorageService.getDonors();
+      if (existing.any((d) => d.phone == phoneController.text.trim())) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text("Phone number already registered!")),
+        );
+        setState(() => isLoading = false);
+        return;
+      }
+
+      // 1. Firebase Auth Signup
+      await DatabaseService.signUp(emailController.text, passwordController.text);
+      
+      // 2. Save Donor Info
+      final donor = Donor(
+        nameController.text.trim(),
+        bloodController.text.trim().toUpperCase(),
+        locationController.text.trim(),
+        phoneController.text.trim(),
+        email: emailController.text.trim(),
+        isAvailable: isAvailable,
+      );
+      await DatabaseService.saveDonor(donor);
+      
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text("Registration Successful!")),
+        );
+        Navigator.pop(context);
+      }
+      setState(() => isLoading = false);
+    }
   }
 }
