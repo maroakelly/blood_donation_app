@@ -9,7 +9,6 @@ import 'package:image_picker/image_picker.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
-import 'package:firebase_storage/firebase_storage.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
 
 void main() async {
@@ -176,21 +175,27 @@ class DatabaseService {
   static const String _donorsKey = 'registered_donors';
 
   // --- AUTHENTICATION ---
-  static Future<UserCredential?> signUp(String email, String password) async {
+  static Future<String?> signUp(String email, String password) async {
     try {
-      return await _auth.createUserWithEmailAndPassword(email: email, password: password);
+      await _auth.createUserWithEmailAndPassword(email: email, password: password);
+      return null; // Success
+    } on FirebaseAuthException catch (e) {
+      return e.message ?? "Registration failed.";
     } catch (e) {
-      debugPrint("Auth SignUp Error: $e");
-      return null;
+      return e.toString();
     }
   }
 
-  static Future<UserCredential?> signIn(String email, String password) async {
+  static Future<String?> signIn(String email, String password) async {
     try {
-      return await _auth.signInWithEmailAndPassword(email: email, password: password);
+      await _auth.signInWithEmailAndPassword(email: email, password: password);
+      return null; // No error
+    } on FirebaseAuthException catch (e) {
+      debugPrint("Auth SignIn Error: ${e.code} - ${e.message}");
+      return e.message ?? "An unknown error occurred.";
     } catch (e) {
       debugPrint("Auth SignIn Error: $e");
-      return null;
+      return e.toString();
     }
   }
 
@@ -251,23 +256,35 @@ class DatabaseService {
   }
 
   // --- REQUEST MANAGEMENT ---
-  static Future<void> broadcastRequest(Map<String, String> request) async {
+  static Future<void> broadcastRequest(Map<String, dynamic> request) async {
     final timestamp = DateTime.now().toIso8601String();
-    final data = {
+    
+    // Data for local storage (no FieldValue)
+    final localData = {
+      ...request,
+      'timestamp': timestamp,
+    };
+
+    // Data for Cloud (includes FieldValue)
+    final cloudData = {
       ...request,
       'timestamp': timestamp,
       'serverTimestamp': FieldValue.serverTimestamp(),
     };
 
     // 1. Save Locally
-    final prefs = await SharedPreferences.getInstance();
-    List<String> history = prefs.getStringList(_historyKey) ?? [];
-    history.insert(0, jsonEncode(data));
-    await prefs.setStringList(_historyKey, history);
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      List<String> history = prefs.getStringList(_historyKey) ?? [];
+      history.insert(0, jsonEncode(localData));
+      await prefs.setStringList(_historyKey, history);
+    } catch (e) {
+      debugPrint("Local save failed: $e");
+    }
 
     // 2. Sync to Cloud
     try {
-      await _db.collection(colRequests).add(data);
+      await _db.collection(colRequests).add(cloudData);
     } catch (e) {
       debugPrint("Cloud broadcast failed: $e");
     }
@@ -533,13 +550,13 @@ class _LoginPageState extends State<LoginPage> {
     if (_formKey.currentState!.validate()) {
       setState(() => isLoading = true);
       
-      var user = await DatabaseService.signIn(emailController.text, passwordController.text);
+      String? errorMessage = await DatabaseService.signIn(emailController.text, passwordController.text);
       
-      if (user != null) {
+      if (errorMessage == null) {
         _onLoginSuccess();
       } else {
         ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text("Login failed. Check credentials or connection."), backgroundColor: Colors.red),
+          SnackBar(content: Text(errorMessage), backgroundColor: Colors.red),
         );
       }
       setState(() => isLoading = false);
@@ -700,9 +717,14 @@ class _DashboardState extends State<Dashboard> {
 
   @override
   Widget build(BuildContext context) {
-    return ListView(
-      padding: const EdgeInsets.all(20),
-      children: [
+    final screenWidth = MediaQuery.of(context).size.width;
+    final crossAxisCount = screenWidth > 600 ? 4 : 2;
+
+    return RefreshIndicator(
+      onRefresh: _loadUrgentRequests,
+      child: ListView(
+        padding: const EdgeInsets.all(20),
+        children: [
         Row(
           children: [
             const Icon(Icons.location_on, color: Colors.red, size: 20),
@@ -719,7 +741,7 @@ class _DashboardState extends State<Dashboard> {
         GridView.count(
           shrinkWrap: true,
           physics: const NeverScrollableScrollPhysics(),
-          crossAxisCount: 2,
+          crossAxisCount: crossAxisCount,
           crossAxisSpacing: 15,
           mainAxisSpacing: 15,
           childAspectRatio: 1.1,
@@ -769,9 +791,11 @@ class _DashboardState extends State<Dashboard> {
           ..._urgentRequests.map((r) => _buildRequestTile(
             r['blood'] ?? '?', 
             r['location'] ?? 'Unknown', 
-            r['date'] ?? 'Recent'
+            r['date'] ?? 'Recent',
+            message: r['message']
           )),
-      ],
+        ],
+      ),
     );
   }
 
@@ -820,7 +844,7 @@ class _DashboardState extends State<Dashboard> {
     );
   }
 
-  Widget _buildRequestTile(String blood, String location, String dist) {
+  Widget _buildRequestTile(String blood, String location, String dist, {String? message}) {
     return Card(
       child: ListTile(
         leading: Container(
@@ -842,7 +866,19 @@ class _DashboardState extends State<Dashboard> {
           ),
         ),
         title: Text(location, style: const TextStyle(fontWeight: FontWeight.bold)),
-        subtitle: Text(dist),
+        subtitle: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(dist),
+            if (message != null && message.isNotEmpty)
+              Text(
+                message,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(fontSize: 12, fontStyle: FontStyle.italic),
+              ),
+          ],
+        ),
         trailing: const Icon(Icons.chevron_right),
         onTap: () {},
       ),
@@ -912,6 +948,9 @@ class _SearchPageState extends State<SearchPage> {
 
   @override
   Widget build(BuildContext context) {
+    final screenWidth = MediaQuery.of(context).size.width;
+    final crossAxisCount = screenWidth > 900 ? 3 : (screenWidth > 600 ? 2 : 1);
+
     final filtered = donorsList
         .where((d) => 
             d.isAvailable &&
@@ -938,7 +977,13 @@ class _SearchPageState extends State<SearchPage> {
               ? const Center(child: CircularProgressIndicator())
               : filtered.isEmpty
                 ? const Center(child: Text("No available donors found"))
-                : ListView.builder(
+                : GridView.builder(
+                    gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+                      crossAxisCount: crossAxisCount,
+                      childAspectRatio: 3,
+                      crossAxisSpacing: 10,
+                      mainAxisSpacing: 10,
+                    ),
                     itemCount: filtered.length,
                     itemBuilder: (context, i) {
                       final d = filtered[i];
@@ -951,10 +996,10 @@ class _SearchPageState extends State<SearchPage> {
                                 ? Text(d.bloodGroup, style: const TextStyle(color: Colors.white, fontSize: 12))
                                 : null,
                           ),
-                          title: Text(d.name, style: const TextStyle(fontWeight: FontWeight.bold)),
-                          subtitle: Text("${d.location} • ${d.bloodGroup}"),
+                          title: Text(d.name, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 14), overflow: TextOverflow.ellipsis),
+                          subtitle: Text("${d.location} • ${d.bloodGroup}", style: const TextStyle(fontSize: 12), overflow: TextOverflow.ellipsis),
                           trailing: IconButton(
-                            icon: const Icon(Icons.phone_enabled_rounded, color: Colors.green),
+                            icon: const Icon(Icons.phone_enabled_rounded, color: Colors.green, size: 20),
                             onPressed: () => _makeCall(d.phone),
                           ),
                         ),
@@ -977,85 +1022,154 @@ class RequestPage extends StatefulWidget {
 }
 
 class _RequestPageState extends State<RequestPage> {
-  final TextEditingController bloodController = TextEditingController();
   final TextEditingController locationController = TextEditingController();
+  final TextEditingController messageController = TextEditingController();
+  String? selectedBloodGroup;
+  final List<String> bloodGroups = ['A+', 'A-', 'B+', 'B-', 'AB+', 'AB-', 'O+', 'O-'];
+  bool isBroadcasting = false;
 
   @override
   void dispose() {
-    bloodController.dispose();
     locationController.dispose();
+    messageController.dispose();
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
-    return SingleChildScrollView(
-      padding: const EdgeInsets.all(30),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          const Text(
-            "Create Blood Request",
-            style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold),
+    final screenWidth = MediaQuery.of(context).size.width;
+    final isTablet = screenWidth > 600;
+
+    return Center(
+      child: ConstrainedBox(
+        constraints: BoxConstraints(maxWidth: isTablet ? 600 : double.infinity),
+        child: SingleChildScrollView(
+          padding: const EdgeInsets.all(30),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text(
+                "Create Blood Request",
+                style: TextStyle(fontSize: 28, fontWeight: FontWeight.bold),
+              ),
+              const SizedBox(height: 8),
+              Text(
+                "Fill the details below to notify nearby donors.",
+                style: TextStyle(color: Colors.grey.shade600, fontSize: 16),
+              ),
+              const SizedBox(height: 35),
+              DropdownButtonFormField<String>(
+                value: selectedBloodGroup,
+                decoration: const InputDecoration(
+                  labelText: "Blood Group Needed",
+                  prefixIcon: Icon(Icons.bloodtype_rounded, color: Colors.red),
+                ),
+                items: bloodGroups.map((group) {
+                  return DropdownMenuItem(value: group, child: Text(group));
+                }).toList(),
+                onChanged: (val) => setState(() => selectedBloodGroup = val),
+              ),
+              const SizedBox(height: 20),
+              TextField(
+                controller: locationController,
+                decoration: const InputDecoration(
+                  labelText: "Hospital Name / Location",
+                  prefixIcon: Icon(Icons.location_on_rounded, color: Colors.red),
+                  hintText: "e.g. City General Hospital",
+                ),
+              ),
+              const SizedBox(height: 20),
+              TextField(
+                controller: messageController,
+                maxLines: 4,
+                decoration: InputDecoration(
+                  labelText: "Message",
+                  alignLabelWithHint: true,
+                  hintText: "Why is the blood needed? (Optional)",
+                  border: OutlineInputBorder(borderRadius: BorderRadius.circular(15)),
+                ),
+              ),
+              const SizedBox(height: 35),
+              SizedBox(
+                width: double.infinity,
+                height: 55,
+                child: ElevatedButton(
+                  onPressed: isBroadcasting ? null : _handleBroadcast,
+                  child: isBroadcasting 
+                    ? const CircularProgressIndicator(color: Colors.white)
+                    : const Text(
+                        "Broadcast Request", 
+                        style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)
+                      ),
+                ),
+              ),
+              const SizedBox(height: 20),
+              if (isBroadcasting)
+                const Center(
+                  child: Text(
+                    "Sending notifications to nearby donors...",
+                    style: TextStyle(color: Colors.red, fontStyle: FontStyle.italic),
+                  ),
+                ),
+            ],
           ),
-          const SizedBox(height: 8),
-          Text("Fill the details below to notify nearby donors.", style: TextStyle(color: Colors.grey.shade600)),
-          const SizedBox(height: 35),
-          TextField(
-            controller: bloodController,
-            decoration: const InputDecoration(
-              labelText: "Blood Group",
-              prefixIcon: Icon(Icons.bloodtype_rounded),
-            ),
-          ),
-          const SizedBox(height: 20),
-          TextField(
-            controller: locationController,
-            decoration: const InputDecoration(
-              labelText: "Hospital Name",
-              prefixIcon: Icon(Icons.location_on_rounded),
-            ),
-          ),
-          const SizedBox(height: 20),
-          TextField(
-            maxLines: 4,
-            decoration: InputDecoration(
-              labelText: "Message",
-              alignLabelWithHint: true,
-              hintText: "Why do you need blood? (Optional)",
-              border: OutlineInputBorder(borderRadius: BorderRadius.circular(15)),
-            ),
-          ),
-          const SizedBox(height: 35),
-          SizedBox(
-            width: double.infinity,
-            child: ElevatedButton(
-              onPressed: () async {
-                if (bloodController.text.isNotEmpty && locationController.text.isNotEmpty) {
-                  await DatabaseService.broadcastRequest({
-                    'blood': bloodController.text,
-                    'location': locationController.text,
-                    'type': 'Request',
-                  });
-                  if (mounted) {
-                    ScaffoldMessenger.of(context).showSnackBar(
-                      const SnackBar(content: Text("Request broadcasted and saved!")),
-                    );
-                    bloodController.clear();
-                    locationController.clear();
-                  }
-                } else {
-                  ScaffoldMessenger.of(context).showSnackBar(
-                    const SnackBar(content: Text("Please fill in blood group and location")),
-                  );
-                }
-              },
-              child: const Text("Broadcast Request"),
-            ),
-          ),
-        ],
+        ),
       ),
     );
+  }
+
+  void _handleBroadcast() async {
+    if (selectedBloodGroup != null && locationController.text.isNotEmpty) {
+      setState(() => isBroadcasting = true);
+      
+      try {
+        await DatabaseService.broadcastRequest({
+          'blood': selectedBloodGroup,
+          'location': locationController.text.trim(),
+          'message': messageController.text.trim(),
+          'type': 'Emergency Request',
+          'date': 'Just now',
+        });
+        
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Row(
+                children: [
+                  const Icon(Icons.check_circle, color: Colors.white),
+                  const SizedBox(width: 10),
+                  Text("Request for $selectedBloodGroup broadcasted!"),
+                ],
+              ),
+              backgroundColor: Colors.green,
+              behavior: SnackBarBehavior.floating,
+            ),
+          );
+          
+          // Clear form
+          setState(() {
+            selectedBloodGroup = null;
+            locationController.clear();
+            messageController.clear();
+          });
+        }
+      } catch (e) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text("Failed to broadcast: $e"), backgroundColor: Colors.red),
+          );
+        }
+      } finally {
+        if (mounted) setState(() => isBroadcasting = false);
+      }
+    } else {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text("Please select blood group and hospital"),
+          backgroundColor: Colors.orange,
+        ),
+      );
+    }
   }
 }
 
@@ -1530,8 +1644,18 @@ class _HistoryPageState extends State<HistoryPage> {
                     backgroundColor: Colors.red.shade100,
                     child: Text(item['blood'] ?? '?', style: const TextStyle(color: Colors.red, fontWeight: FontWeight.bold)),
                   ),
-                  title: Text(item['location'] ?? 'Unknown Location'),
-                  subtitle: Text("${item['type']} • ${item['date']}"),
+                  title: Text(item['location'] ?? 'Unknown Location', style: const TextStyle(fontWeight: FontWeight.bold)),
+                  subtitle: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text("${item['type'] ?? 'Request'} • ${item['date'] ?? _formatTimestamp(item['timestamp'])}"),
+                      if (item['message'] != null && item['message'].toString().isNotEmpty)
+                        Text(
+                          item['message'],
+                          style: const TextStyle(fontSize: 12, fontStyle: FontStyle.italic),
+                        ),
+                    ],
+                  ),
                   trailing: const Icon(Icons.check_circle, color: Colors.green),
                 ),
               );
@@ -1540,6 +1664,19 @@ class _HistoryPageState extends State<HistoryPage> {
         },
       ),
     );
+  }
+
+  String _formatTimestamp(dynamic timestamp) {
+    if (timestamp == null) return "Recent";
+    if (timestamp is String) {
+      try {
+        final dt = DateTime.parse(timestamp);
+        return "${dt.day}/${dt.month} ${dt.hour}:${dt.minute}";
+      } catch (_) {
+        return timestamp;
+      }
+    }
+    return "Recent";
   }
 }
 
@@ -1742,7 +1879,7 @@ class _RegisterPageState extends State<RegisterPage> {
       setState(() => isLoading = true);
       
       // Duplicate prevention (Check local & could check Firebase)
-      final existing = await StorageService.getDonors();
+      final existing = await DatabaseService.getAllDonors();
       if (existing.any((d) => d.phone == phoneController.text.trim())) {
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(content: Text("Phone number already registered!")),
@@ -1752,7 +1889,14 @@ class _RegisterPageState extends State<RegisterPage> {
       }
 
       // 1. Firebase Auth Signup
-      await DatabaseService.signUp(emailController.text, passwordController.text);
+      String? authError = await DatabaseService.signUp(emailController.text, passwordController.text);
+      if (authError != null) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(authError), backgroundColor: Colors.red),
+        );
+        setState(() => isLoading = false);
+        return;
+      }
       
       // 2. Save Donor Info
       final donor = Donor(
